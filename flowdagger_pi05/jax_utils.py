@@ -4,15 +4,14 @@ eval/sample, image augmentations, and add_batch_dim.
 
 from functools import partial
 import functools
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Dict, Tuple
 
-import distrax
 import flax
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from buffer import DatasetDict
+DatasetDict = Dict[str, Any]
 
 PRNGKey = Any
 Params = flax.core.FrozenDict[str, Any]
@@ -21,7 +20,7 @@ Params = flax.core.FrozenDict[str, Any]
 # --- action eval / sample -------------------------------------------------
 
 @partial(jax.jit, static_argnames='actor_apply_fn')
-def eval_actions_jit(actor_apply_fn: Callable[..., distrax.Distribution],
+def eval_actions_jit(actor_apply_fn: Callable[..., Any],
                      actor_params: Params,
                      observations: np.ndarray,
                      actor_batch_stats: Any) -> jnp.ndarray:
@@ -35,7 +34,7 @@ def eval_actions_jit(actor_apply_fn: Callable[..., distrax.Distribution],
 
 @partial(jax.jit, static_argnames='actor_apply_fn')
 def sample_actions_jit(
-        rng: PRNGKey, actor_apply_fn: Callable[..., distrax.Distribution],
+        rng: PRNGKey, actor_apply_fn: Callable[..., Any],
         actor_params: Params,
         observations: np.ndarray,
         actor_batch_stats: Any) -> Tuple[PRNGKey, jnp.ndarray]:

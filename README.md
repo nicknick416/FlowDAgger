@@ -14,6 +14,11 @@ loss.
 This repo is a minimal, self-contained reference implementation on the pi0.5
 base policy (JAX / openpi), running the MetaWorld assembly task.
 
+The `flowdagger_pi05/arx_*` modules add the ARX bimanual deployment: a
+three-camera/20D adapter, atomic episode store, ZMQ episode protocol, pi0.5
+fixed-point inversion, and a versioned steering-only trainer. The base
+checkpoint is always loaded read-only.
+
 ## How this example works
 
 1. Roll out the base policy. A steering network predicts the sampling noise.

@@ -30,7 +30,7 @@ from nets import (
     LearnedStdTanhNormalPolicy,
     LearnedStdNormalPolicy,
 )
-from buffer import DatasetDict
+DatasetDict = Dict[str, Any]
 
 
 class TrainState(train_state.TrainState):
@@ -197,6 +197,20 @@ class SteeringPolicy:
             self.color_jitter, self.num_cameras,
         )
         return info
+
+    def evaluate_mse(self, batch: FrozenDict) -> float:
+        """Deterministic BC MSE used for held-out episode validation."""
+        observations = batch['observations']
+        if self._actor.batch_stats is not None:
+            dist = self._actor.apply_fn(
+                {'params': self._actor.params, 'batch_stats': self._actor.batch_stats},
+                observations,
+            )
+        else:
+            dist = self._actor.apply_fn({'params': self._actor.params}, observations)
+        predicted = dist.mode()
+        target = batch['actions'].reshape(predicted.shape)
+        return float(jnp.mean(jnp.square(predicted - target)))
 
     @property
     def _save_dict(self):

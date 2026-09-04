@@ -3,9 +3,8 @@ pixel encoder, PixelMultiplexer, passthrough encoder for precomputed features,
 and the learned-std (tanh / linear) policy heads.
 """
 
-from typing import Any, Callable, Dict, Optional, Sequence, Union
+from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Union
 
-import distrax
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -139,6 +138,39 @@ class PrecomputedFeatureEncoder(nn.Module):
 
 # --- policy heads ---------------------------------------------------------
 
+class _DiagNormal(NamedTuple):
+    """Minimal JAX-pytree distribution needed by the steering BC actor."""
+
+    loc: jnp.ndarray
+    scale_diag: jnp.ndarray
+
+    def mode(self) -> jnp.ndarray:
+        return self.loc
+
+    def sample(self, seed) -> jnp.ndarray:
+        return self.loc + self.scale_diag * jax.random.normal(seed, self.loc.shape)
+
+
+class TanhMultivariateNormalDiag(NamedTuple):
+    loc: jnp.ndarray
+    scale_diag: jnp.ndarray
+    low: Optional[float] = None
+    high: Optional[float] = None
+
+    def _squash(self, value: jnp.ndarray) -> jnp.ndarray:
+        value = jnp.tanh(value)
+        if self.low is not None and self.high is not None:
+            value = (value + 1.0) / 2.0
+            value = value * (self.high - self.low) + self.low
+        return value
+
+    def mode(self) -> jnp.ndarray:
+        return self._squash(self.loc)
+
+    def sample(self, seed) -> jnp.ndarray:
+        value = self.loc + self.scale_diag * jax.random.normal(seed, self.loc.shape)
+        return self._squash(value)
+
 class LearnedStdNormalPolicy(nn.Module):
     hidden_dims: Sequence[int]
     action_dim: int
@@ -149,7 +181,7 @@ class LearnedStdNormalPolicy(nn.Module):
     @nn.compact
     def __call__(self,
                  observations: jnp.ndarray,
-                 training: bool = False) -> distrax.Distribution:
+                 training: bool = False) -> _DiagNormal:
         outputs = MLP(self.hidden_dims,
                       activate_final=True,
                       dropout_rate=self.dropout_rate)(observations,
@@ -160,48 +192,8 @@ class LearnedStdNormalPolicy(nn.Module):
         log_stds = nn.Dense(self.action_dim, kernel_init=default_init(1e-2))(outputs)
         log_stds = jnp.clip(log_stds, self.log_std_min, self.log_std_max)
 
-        distribution = distrax.MultivariateNormalDiag(loc=means, scale_diag=jnp.exp(log_stds))
+        distribution = _DiagNormal(loc=means, scale_diag=jnp.exp(log_stds))
         return distribution
-
-
-class TanhMultivariateNormalDiag(distrax.Transformed):
-
-    def __init__(self,
-                 loc: jnp.ndarray,
-                 scale_diag: jnp.ndarray,
-                 low: Optional[jnp.ndarray] = None,
-                 high: Optional[jnp.ndarray] = None):
-        distribution = distrax.MultivariateNormalDiag(loc=loc,
-                                                      scale_diag=scale_diag)
-
-        layers = []
-
-        if not (low is None or high is None):
-
-            def rescale_from_tanh(x):
-                x = (x + 1) / 2  # (-1, 1) => (0, 1)
-                return x * (high - low) + low
-
-            def forward_log_det_jacobian(x):
-                high_ = jnp.broadcast_to(high, x.shape)
-                low_ = jnp.broadcast_to(low, x.shape)
-                return jnp.sum(jnp.log(0.5 * (high_ - low_)), -1)
-
-            layers.append(
-                distrax.Lambda(
-                    rescale_from_tanh,
-                    forward_log_det_jacobian=forward_log_det_jacobian,
-                    event_ndims_in=1,
-                    event_ndims_out=1))
-
-        layers.append(distrax.Block(distrax.Tanh(), 1))
-
-        bijector = distrax.Chain(layers)
-
-        super().__init__(distribution=distribution, bijector=bijector)
-
-    def mode(self) -> jnp.ndarray:
-        return self.bijector.forward(self.distribution.mode())
 
 
 class LearnedStdTanhNormalPolicy(nn.Module):
@@ -216,7 +208,7 @@ class LearnedStdTanhNormalPolicy(nn.Module):
     @nn.compact
     def __call__(self,
                  observations: jnp.ndarray,
-                 training: bool = False) -> distrax.Distribution:
+                 training: bool = False) -> TanhMultivariateNormalDiag:
         outputs = MLP(self.hidden_dims,
                       activate_final=True,
                       dropout_rate=self.dropout_rate)(observations,

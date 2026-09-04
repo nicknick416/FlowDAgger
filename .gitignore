@@ -23,3 +23,13 @@ checkpoints/
 .envrc
 .env
 .DS_Store
+
+# Local backups, caches, vendor copies, accidental artifacts
+.codex_backups/
+.pytest_cache/
+vendor/
+ys,tempfile
+flowdagger_pi05/Untitled
+*.bak*
+*.bak_*
+=ARXFlowDaggerServer*

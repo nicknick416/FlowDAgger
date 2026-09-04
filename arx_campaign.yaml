@@ -1,0 +1,37 @@
+# ARX FlowDAgger campaign 配置。
+# 改这里并重启服务即可，不必改 Python。
+# 新开一轮训练：改 campaign_id（output_root 默认是 {runs_root}/{campaign_id}）。
+# 不要把旧 campaign 的 episode / ACTIVE 拷进新目录。
+
+# --- 路径与身份 ---
+campaign_id: arx_connect_elevator_pins_0901_base_retrain_v6
+runs_root: /home/ubuntu/yzy/flowdagger_runs
+# 可选。不填则使用 {runs_root}/{campaign_id}
+# output_root: /home/ubuntu/yzy/flowdagger_runs/arx_connect_elevator_pins_0901_base_retrain_v5
+
+openpi_root: /home/ubuntu/yzy/openpi
+openpi_config: arx_connect_elevator_pins
+base_checkpoint: /home/ubuntu/checkpoints/pi05/arx_connect_elevator_pins/connect_elevator_pins_arx_0901/20000
+base_checkpoint_name: connect_elevator_pins_arx_0901
+base_checkpoint_step: 20000
+base_asset_id: connect_elevator_pins_arx_0901
+
+raw_data_root: /home/ubuntu/yzy/flowdagger_runs/raw_data
+demo_buffer_dir: /home/ubuntu/yzy/flowdagger_runs/raw_data/arx_connect_elevator_pins_raw_data
+demo_buffer_count: 30
+
+addr: tcp://*:5557
+default_prompt: pick up the female connector and plug into the fixed male connector
+
+# --- 在线 / 离线训练 ---
+window_stride: 10
+online_bc_steps: 100
+online_bc_batch_size: 64
+online_intervention_mix: 0.4
+online_autonomous_mix: 0.4
+online_demonstration_mix: 0.2
+steering_lr: 1.0e-4
+norm_freeze_min_success_episodes: 3
+inversion_batch_size: 1
+offline_inversion_batch_size: 2
+inversion_mse_threshold: 1.0e-3
