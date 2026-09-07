@@ -59,7 +59,15 @@ def test_explicit_output_root_wins():
     assert cfg.output_root == "/data/custom"
 
 
-def test_missing_campaign_id_raises():
+def test_zero_demonstration_mix_is_allowed():
+    cfg = campaign_config_from_mapping(
+        _payload(
+            online_intervention_mix=0.5,
+            online_autonomous_mix=0.5,
+            online_demonstration_mix=0.0,
+        )
+    )
+    assert cfg.online_demonstration_mix == 0.0
     data = _payload()
     del data["campaign_id"]
     with pytest.raises(ValueError, match="missing"):

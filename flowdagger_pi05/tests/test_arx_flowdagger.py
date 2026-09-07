@@ -1,15 +1,19 @@
 import json
 import re
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
+from arx_campaign import get_campaign_config, set_campaign_config
 from arx_adapter import (
+    is_parking_action_window,
     pad_actions_with_policy,
     policy_rows_without_later_intervention,
+    trim_leading_hold_prefix,
 )
 from arx_flowdagger_server import ARXFlowDaggerServer
 from arx_episode_store import EpisodeStore
@@ -20,6 +24,7 @@ from arx_trainer import (
     bc_milestone_steps,
     online_batch_mix_sizes,
     online_episode_isolated_split,
+    online_source_enabled,
     schedule_bc_hyperparams,
     should_freeze_target_normalization,
 )
@@ -249,6 +254,189 @@ def test_server_skips_leading_and_trailing_holds_but_keeps_interior(tmp_path):
     assert [row["step_id"] for row in experts] == [4, 5, 6, 7, 8]
     policy_row = next(row for row in steps if row["kind"] == "policy")
     assert np.asarray(policy_row["predicted_actions"]).shape == (50, 20)
+
+
+def _jitter_state(step: int, amp: float = 0.0008) -> list[float]:
+    state = [0.0] * 20
+    state[0] = amp if step % 2 == 0 else -amp
+    return state
+
+
+def test_trim_leading_hold_prefix_drops_jitter_until_release():
+    parked = [0.0] * 20
+    prefix = [{"state": _jitter_state(step)} for step in range(12)]
+    moving = [{"state": _moving_state(step)} for step in range(1, 6)]
+    kept = trim_leading_hold_prefix(prefix + moving, reference_state=parked)
+    assert [row["state"][0] for row in kept] == [step * 0.01 for step in range(1, 6)]
+
+
+def test_trim_leading_hold_prefix_keeps_interior_holds():
+    parked = [0.0] * 20
+    moving = [{"state": _moving_state(8)}]
+    interior = [{"state": _moving_state(8)} for _ in range(4)]
+    later = [{"state": _moving_state(12)}]
+    kept = trim_leading_hold_prefix(
+        moving + interior + later, reference_state=parked
+    )
+    assert len(kept) == 6
+    assert kept[1]["state"] == _moving_state(8)
+
+
+def test_trim_leading_hold_prefix_drops_entire_parked_segment():
+    parked = [0.0] * 20
+    prefix = [{"state": _jitter_state(step)} for step in range(20)]
+    assert trim_leading_hold_prefix(prefix, reference_state=parked) == []
+    assert trim_leading_hold_prefix([]) == []
+
+
+def test_trim_leading_hold_prefix_keeps_two_millimeter_seating():
+    parked = [0.0] * 20
+    prefix = [{"state": _jitter_state(step)} for step in range(8)]
+    seated = [0.0] * 20
+    seated[0] = 0.002
+    kept = trim_leading_hold_prefix(prefix + [{"state": seated}], reference_state=parked)
+    assert len(kept) == 1
+    assert kept[0]["state"][0] == pytest.approx(0.002)
+
+
+def test_is_parking_action_window_drops_hold_keeps_two_mm_seat():
+    parked = np.tile(np.asarray(_moving_state(5), dtype=np.float32), (50, 1))
+    assert is_parking_action_window(parked)
+    seat = np.zeros((50, 20), dtype=np.float32)
+    seat[:, 0] = np.linspace(0.0, 0.002, 50)
+    assert not is_parking_action_window(seat)
+    wander = np.zeros((50, 20), dtype=np.float32)
+    wander[:, 0] = np.linspace(0.0, 0.0005, 50)
+    assert is_parking_action_window(wander)
+
+
+def test_expert_windows_drop_interior_parking_slices(tmp_path):
+    store = EpisodeStore(tmp_path)
+    store.start("interior-park", run_stage="bootstrap")
+    frame = _frame()
+    store.append_observation(
+        kind="policy", step_id=0, images=frame, state=[0.0] * 20,
+        prompt="connect", request_generation=1,
+    )
+    store.append_event("intervention_start", step_id=1)
+    store.append_observation(
+        kind="boundary", step_id=1, images=frame, state=[0.0] * 20,
+        prompt="connect", request_generation=1,
+    )
+    parked = _moving_state(20)
+    for step in range(2, 52):
+        store.append_observation(
+            kind="expert", step_id=step, images=frame,
+            state=_moving_state(step), prompt="connect",
+        )
+    for step in range(52, 112):
+        store.append_observation(
+            kind="expert", step_id=step, images=frame,
+            state=parked, prompt="connect",
+        )
+    for step in range(112, 162):
+        store.append_observation(
+            kind="expert", step_id=step, images=frame,
+            state=_moving_state(step), prompt="connect",
+        )
+    episode = store.finish("success")
+    runtime = object.__new__(ARXFlowDaggerRuntime)
+    runtime.default_prompt = "connect"
+    windows = list(runtime._load_expert_windows(episode))
+    assert windows
+    for _, actions, info in windows:
+        assert not is_parking_action_window(actions[: int(info["valid_length"])])
+        net = float(np.linalg.norm(actions[-1, :3] - actions[0, :3]))
+        assert net >= 0.001
+
+
+def test_expert_windows_skip_leading_hold_prefix(tmp_path):
+    store = EpisodeStore(tmp_path)
+    store.start("hold-prefix", run_stage="bootstrap")
+    frame = _frame()
+    store.append_observation(
+        kind="policy", step_id=0, images=frame, state=[0.0] * 20,
+        prompt="connect", request_generation=1,
+    )
+    store.append_event("intervention_start", step_id=1)
+    store.append_observation(
+        kind="boundary", step_id=1, images=frame, state=[0.0] * 20,
+        prompt="connect", request_generation=1,
+    )
+    for step in range(2, 14):
+        store.append_observation(
+            kind="expert", step_id=step, images=frame,
+            state=_jitter_state(step), prompt="connect",
+        )
+    for step in range(14, 64):
+        store.append_observation(
+            kind="expert", step_id=step, images=frame,
+            state=_moving_state(step), prompt="connect",
+        )
+    episode = store.finish("success")
+    runtime = object.__new__(ARXFlowDaggerRuntime)
+    runtime.default_prompt = "connect"
+    windows = list(runtime._load_expert_windows(episode))
+    assert windows
+    assert windows[0][2]["valid_length"] == 50
+    np.testing.assert_allclose(windows[0][1][0], _moving_state(14))
+
+
+def test_expert_windows_drop_parked_only_intervention(tmp_path):
+    store = EpisodeStore(tmp_path)
+    store.start("parked-only", run_stage="bootstrap")
+    frame = _frame()
+    store.append_observation(
+        kind="policy", step_id=0, images=frame, state=[0.0] * 20,
+        prompt="connect",
+    )
+    store.append_event("intervention_start", step_id=1)
+    for step in range(1, 60):
+        store.append_observation(
+            kind="expert", step_id=step, images=frame,
+            state=_jitter_state(step), prompt="connect",
+        )
+    episode = store.finish("success")
+    runtime = object.__new__(ARXFlowDaggerRuntime)
+    runtime.default_prompt = "connect"
+    assert list(runtime._load_expert_windows(episode)) == []
+
+
+def test_server_skips_jittery_hold_prefix(tmp_path):
+    runtime = FakeRuntime()
+    server = ARXFlowDaggerServer(
+        runtime, output_root=tmp_path, default_prompt="connect",
+    )
+    server.handle_message({
+        "cmd": "episode_start", "episode_id": "jitter", "shadow_mode": True,
+    })
+    policy = [0.0] * 20
+    server.handle_message({
+        "cmd": "predict", "episode_id": "jitter", "step_id": 0,
+        "state": policy, **images(),
+    })
+    server.handle_message({"cmd": "intervention_start", "episode_id": "jitter"})
+    for step in range(1, 8):
+        result = server.handle_message({
+            "cmd": "expert_step", "episode_id": "jitter", "step_id": step,
+            "state": _jitter_state(step), **images(),
+        })
+        assert result.get("skipped_pause") is True
+    result = server.handle_message({
+        "cmd": "expert_step", "episode_id": "jitter", "step_id": 8,
+        "state": _moving_state(8), **images(),
+    })
+    assert "skipped_pause" not in result
+    server.handle_message({"cmd": "intervention_stop", "episode_id": "jitter"})
+    result = server.handle_message({
+        "cmd": "episode_end", "episode_id": "jitter", "label": "abort",
+    })
+    steps = [
+        json.loads(line)
+        for line in (Path(result["episode_dir"]) / "steps.jsonl").read_text().splitlines()
+    ]
+    experts = [row for row in steps if row["kind"] == "expert"]
+    assert [row["step_id"] for row in experts] == [8]
 
 
 def test_steering_coefficients_are_clipped_then_denormalized():
@@ -762,12 +950,39 @@ def test_bc_schedule_follows_50_epochs_and_min_batch_64():
     assert schedule_bc_hyperparams(193) == (64, 200)
 
 
-def test_online_batch_mix_is_4_4_2():
+@pytest.fixture
+def restore_campaign_config():
+    original = get_campaign_config()
+    yield
+    set_campaign_config(original)
+
+
+def _set_online_mix(intervention: float, autonomous: float, demonstration: float):
+    set_campaign_config(
+        replace(
+            get_campaign_config(),
+            online_intervention_mix=intervention,
+            online_autonomous_mix=autonomous,
+            online_demonstration_mix=demonstration,
+        )
+    )
+
+
+def test_online_batch_mix_is_4_4_2(restore_campaign_config):
+    _set_online_mix(0.4, 0.4, 0.2)
     assert ONLINE_BC_STEPS == 100
     assert online_batch_mix_sizes(64, 10, 10, 10) == (26, 26, 12)
     assert online_batch_mix_sizes(64, 10, 0, 10) == (43, 0, 21)
     assert online_batch_mix_sizes(64, 10, 0, 0) == (64, 0, 0)
     assert online_batch_mix_sizes(1, 10, 10, 10) == (1, 0, 0)
+
+
+def test_zero_demonstration_mix_excludes_raw_data(restore_campaign_config):
+    _set_online_mix(0.5, 0.5, 0.0)
+    assert online_source_enabled("demonstration") is False
+    assert online_batch_mix_sizes(64, 10, 10, 331) == (32, 32, 0)
+    assert online_batch_mix_sizes(64, 10, 0, 331) == (64, 0, 0)
+    assert online_batch_mix_sizes(64, 0, 0, 331) == (0, 0, 0)
 
 
 def test_normalization_freezes_after_three_success_episodes():

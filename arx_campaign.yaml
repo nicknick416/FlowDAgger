@@ -4,7 +4,7 @@
 # 不要把旧 campaign 的 episode / ACTIVE 拷进新目录。
 
 # --- 路径与身份 ---
-campaign_id: arx_connect_elevator_pins_0901_base_retrain_v6
+campaign_id: arx_connect_elevator_pins_0901_base_retrain_v10
 runs_root: /home/ubuntu/yzy/flowdagger_runs
 # 可选。不填则使用 {runs_root}/{campaign_id}
 # output_root: /home/ubuntu/yzy/flowdagger_runs/arx_connect_elevator_pins_0901_base_retrain_v5
@@ -27,9 +27,12 @@ default_prompt: pick up the female connector and plug into the fixed male connec
 window_stride: 10
 online_bc_steps: 100
 online_bc_batch_size: 64
-online_intervention_mix: 0.4
-online_autonomous_mix: 0.4
-online_demonstration_mix: 0.2
+# online_intervention_mix: 0.4
+# online_autonomous_mix: 0.4
+# online_demonstration_mix: 0.2
+online_intervention_mix: 0.5
+online_autonomous_mix: 0.5
+online_demonstration_mix: 0.0
 steering_lr: 1.0e-4
 norm_freeze_min_success_episodes: 3
 inversion_batch_size: 1

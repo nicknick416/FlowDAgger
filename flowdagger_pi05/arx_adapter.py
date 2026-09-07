@@ -29,6 +29,16 @@ PROTOCOL_VERSION = 3
 # micro-motions are kept; only prefix/suffix runs at a mode boundary are trimmed.
 PAUSE_POSITION_M = 5e-4
 PAUSE_GRIPPER = 1e-3
+# Leave the takeover pose before treating expert motion as a training target.
+# Measured from the pose at takeover, not from the insert hole. 1 mm drops
+# stick-pickup jitter and a parked wait, but keeps 2–5 mm seating nudges.
+HOLD_PREFIX_RELEASE_M = 1e-3
+HOLD_PREFIX_GRIPPER = 1e-2
+# A 50-step expert window that never left a 1 mm ball is a parked wait, not
+# seating. Seating of 2–5 mm must still train, so this is AND with hold
+# fraction, not the earlier "net <5 mm OR hold>80%" cut.
+PARKING_WINDOW_NET_M = 1e-3
+PARKING_WINDOW_HOLD_FRACTION = 0.8
 _cfg = get_campaign_config()
 BASE_CHECKPOINT_NAME = _cfg.base_checkpoint_name
 BASE_CHECKPOINT_STEP = _cfg.base_checkpoint_step
@@ -94,6 +104,83 @@ def is_control_hold(
     right = float(np.linalg.norm(previous[10:13] - current[10:13]))
     grip = abs(float(previous[9] - current[9])) + abs(float(previous[19] - current[19]))
     return left < position_m and right < position_m and grip < gripper
+
+
+def still_at_reference_pose(
+    reference_state: Any,
+    current_state: Any,
+    *,
+    position_m: float = HOLD_PREFIX_RELEASE_M,
+    gripper: float = HOLD_PREFIX_GRIPPER,
+) -> bool:
+    """True when the current pose has not left the takeover parking ball."""
+    reference = np.asarray(reference_state, dtype=np.float64).reshape(-1)
+    current = np.asarray(current_state, dtype=np.float64).reshape(-1)
+    if reference.shape != (STATE_DIM,) or current.shape != (STATE_DIM,):
+        return False
+    left = float(np.linalg.norm(reference[:3] - current[:3]))
+    right = float(np.linalg.norm(reference[10:13] - current[10:13]))
+    grip = abs(float(reference[9] - current[9])) + abs(
+        float(reference[19] - current[19])
+    )
+    return left < position_m and right < position_m and grip < gripper
+
+
+def trim_leading_hold_prefix(
+    rows: list[dict[str, Any]],
+    *,
+    reference_state: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Drop the parked wait after takeover, even if consecutive ticks jitter.
+
+    Frames stay in the prefix while both arms remain within
+    ``HOLD_PREFIX_RELEASE_M`` (1 mm) of the takeover pose. The first frame that
+    leaves that ball starts the kept expert trajectory, including later
+    interior holds. A segment that never leaves the ball is dropped entirely.
+    """
+    if not rows:
+        return []
+    reference = (
+        reference_state if reference_state is not None else rows[0]["state"]
+    )
+    start = 0
+    while start < len(rows) and still_at_reference_pose(
+        reference, rows[start]["state"]
+    ):
+        start += 1
+    return rows[start:]
+
+
+def is_parking_action_window(
+    actions: Any,
+    *,
+    net_m: float = PARKING_WINDOW_NET_M,
+    hold_fraction: float = PARKING_WINDOW_HOLD_FRACTION,
+    position_m: float = PAUSE_POSITION_M,
+    gripper: float = HOLD_PREFIX_GRIPPER,
+) -> bool:
+    """True when a horizon chunk stays parked (wait), not a small seating nudge.
+
+    Prefix trim already dropped the takeover wait. Remaining parking happens
+    mid-segment: a 50-step slice of interior hold. Drop only when *both* arms
+    and grippers net less than ``net_m`` *and* most consecutive ticks are
+    holds. A 2 mm insert seat has hold_frac ~0.9 but net above 1 mm, so it
+    is kept.
+    """
+    chunk = np.asarray(actions, dtype=np.float64)
+    if chunk.ndim != 2 or chunk.shape[-1] < 20 or len(chunk) < 2:
+        return False
+    left_net = float(np.linalg.norm(chunk[-1, :3] - chunk[0, :3]))
+    right_net = float(np.linalg.norm(chunk[-1, 10:13] - chunk[0, 10:13]))
+    grip_net = abs(float(chunk[-1, 9] - chunk[0, 9])) + abs(
+        float(chunk[-1, 19] - chunk[0, 19])
+    )
+    if max(left_net, right_net) >= net_m or grip_net >= gripper:
+        return False
+    left_step = np.linalg.norm(np.diff(chunk[:, :3], axis=0), axis=1)
+    right_step = np.linalg.norm(np.diff(chunk[:, 10:13], axis=0), axis=1)
+    hold_frac = float(np.mean((left_step < position_m) & (right_step < position_m)))
+    return hold_frac >= hold_fraction
 
 
 def trim_boundary_holds(

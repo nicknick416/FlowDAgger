@@ -19,6 +19,7 @@ import zmq
 from arx_adapter import (
     CAMERA_KEYS, PROTOCOL_VERSION,
     build_openpi_observation, is_control_hold, resolve_base_model_identity,
+    still_at_reference_pose,
 )
 from arx_campaign import get_campaign_config, preload_campaign_config, add_arx_runtime_args
 from arx_episode_store import EpisodeStore
@@ -414,6 +415,7 @@ class ARXFlowDaggerServer:
             self._intervening = cmd == "intervention_start"
             if self._intervening:
                 self._reset_intervention_pause_state(keep_last_state=True)
+                self._takeover_state = self._last_control_state
                 self.store.append_event(
                     cmd,
                     step_id=int(message.get("step_id", 0)),
@@ -429,6 +431,8 @@ class ARXFlowDaggerServer:
                         request_generation=int(message.get("request_generation", 0)),
                     )
                     self._last_control_state = message["state"]
+                    if self._takeover_state is None:
+                        self._takeover_state = message["state"]
                     self.store.append_event(
                         "intervention_boundary_saved",
                         boundary_record_sequence=boundary_record_sequence,
@@ -556,6 +560,7 @@ class ARXFlowDaggerServer:
         self._intervention_motion_started = False
         if not keep_last_state:
             self._last_control_state = None
+            self._takeover_state = None
 
     def _drop_trailing_holds(self) -> int:
         dropped = len(self._expert_hold_buffer)
@@ -590,6 +595,11 @@ class ARXFlowDaggerServer:
             and is_control_hold(self._last_control_state, state)
         )
         if not self._intervention_motion_started:
+            reference = self._takeover_state
+            if reference is None:
+                reference = self._last_control_state
+            if reference is not None and still_at_reference_pose(reference, state):
+                return {"status": "ok", "skipped_pause": True}
             if hold:
                 return {"status": "ok", "skipped_pause": True}
             self._intervention_motion_started = True

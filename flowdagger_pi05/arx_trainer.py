@@ -25,11 +25,13 @@ from arx_adapter import (
     OpenPIActionTransformAdapter,
     build_openpi_observation,
     extract_vlm_feature,
+    is_parking_action_window,
     pad_actions_with_policy,
     policy_rows_without_later_intervention,
     predicted_actions_from_row,
     resolve_base_model_identity,
     trim_boundary_holds,
+    trim_leading_hold_prefix,
 )
 from arx_campaign import get_campaign_config
 from arx_demo_buffer import iter_demo_episode_dirs, iter_raw_expert_windows
@@ -59,26 +61,42 @@ ONLINE_DEMONSTRATION_MIX = _cfg.online_demonstration_mix
 NORM_FREEZE_MIN_SUCCESS_EPISODES = _cfg.norm_freeze_min_success_episodes
 
 
+def online_mix_weights() -> dict[str, float]:
+    cfg = get_campaign_config()
+    return {
+        "intervention": float(cfg.online_intervention_mix),
+        "autonomous": float(cfg.online_autonomous_mix),
+        "demonstration": float(cfg.online_demonstration_mix),
+    }
+
+
+def online_source_enabled(name: str) -> bool:
+    return online_mix_weights()[name] > 0
+
+
 def online_batch_mix_sizes(
     batch_size: int,
     n_intervention: int = 0,
     n_autonomous: int = 0,
     n_demonstration: int = 0,
 ) -> tuple[int, int, int]:
-    """Split one BC batch 4:4:2 across intervention/autonomous/demonstration."""
+    """Split one BC batch by campaign mix weights.
+
+    A source with mix weight 0 is excluded even if windows exist, so
+    `online_demonstration_mix=0` never injects raw-data demonstrations.
+    """
     batch_size = int(batch_size)
     available = {
         "intervention": max(int(n_intervention), 0),
         "autonomous": max(int(n_autonomous), 0),
         "demonstration": max(int(n_demonstration), 0),
     }
-    cfg = get_campaign_config()
-    weights = {
-        "intervention": cfg.online_intervention_mix,
-        "autonomous": cfg.online_autonomous_mix,
-        "demonstration": cfg.online_demonstration_mix,
-    }
-    active = [name for name, count in available.items() if count > 0]
+    weights = online_mix_weights()
+    active = [
+        name
+        for name, count in available.items()
+        if count > 0 and weights[name] > 0
+    ]
     if batch_size < 1 or not active:
         return 0, 0, 0
     if batch_size < len(active):
@@ -444,15 +462,18 @@ class ARXFlowDaggerRuntime:
                         info["origin"] = origin
                         info["episode_path"] = str(episode_dir.resolve())
                         windows.append((observation, actions, info))
-                demo_root = Path(
-                    self._online_context.get("demonstration_dir", self.demo_buffer_dir)
-                )
-                for episode_dir in iter_demo_episode_dirs(demo_root):
-                    for observation, actions, info in iter_raw_expert_windows(
-                        episode_dir, prompt=self.default_prompt
-                    ):
-                        info["episode_path"] = str(Path(episode_dir).absolute())
-                        windows.append((observation, actions, info))
+                if online_source_enabled("demonstration"):
+                    demo_root = Path(
+                        self._online_context.get(
+                            "demonstration_dir", self.demo_buffer_dir
+                        )
+                    )
+                    for episode_dir in iter_demo_episode_dirs(demo_root):
+                        for observation, actions, info in iter_raw_expert_windows(
+                            episode_dir, prompt=self.default_prompt
+                        ):
+                            info["episode_path"] = str(Path(episode_dir).absolute())
+                            windows.append((observation, actions, info))
             if not windows:
                 raise ValueError("successful episode contains no complete expert transitions")
             progress(
@@ -755,6 +776,14 @@ class ARXFlowDaggerRuntime:
                 validation_episodes = np.unique(episode_ids[validation_indices])
 
             if len(train_indices) == 0 or len(validation_indices) == 0:
+                if online:
+                    return {
+                        "state": "no_improvement",
+                        "reason": "no_train_windows"
+                        if len(train_indices) == 0
+                        else "no_validation_windows",
+                        "policy_version": current_version,
+                    }
                 raise RuntimeError("empty train or validation split")
 
             if online:
@@ -1363,7 +1392,12 @@ class ARXFlowDaggerRuntime:
             )
             if first_index > 0:
                 previous_state = rows[first_index - 1].get("state")
-            group = trim_boundary_holds(group, previous_state=previous_state)
+            group = trim_leading_hold_prefix(
+                group, reference_state=previous_state
+            )
+            # Trailing switch-delay only. Leading wait is the takeover-pose
+            # ball above; passing previous_state here would re-trim by 0.5 mm.
+            group = trim_boundary_holds(group)
             if not group:
                 continue
             segment = int(group[0].get("intervention_segment_id", 0))
@@ -1403,6 +1437,9 @@ class ARXFlowDaggerRuntime:
                 if not len(actions):
                     continue
                 if int(pad_info.get("valid_length") or 0) < MIN_INTERVENTION_VALID_LENGTH:
+                    continue
+                valid_length = int(pad_info["valid_length"])
+                if is_parking_action_window(actions[:valid_length]):
                     continue
                 observation = self._observation_from_row(episode_dir, active_anchor)
                 yield observation, actions, {
